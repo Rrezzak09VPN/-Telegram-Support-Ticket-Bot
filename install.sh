@@ -23,7 +23,7 @@ BACKUP_DIR="${INSTALL_DIR}/backups"
 CONFIG_FILE="${INSTALL_DIR}/config.env"
 SERVICE_NAME="support-bot"
 VENV_DIR="${INSTALL_DIR}/venv"
-REPO_URL="https://raw.githubusercontent.com/YOU/support-bot/main"
+REPO_URL="https://raw.githubusercontent.com/Rrezzak09VPN/-Telegram-Support-Ticket-Bot/main"
 MIN_PYTHON="3.10"
 
 # ── Функции вывода ──
