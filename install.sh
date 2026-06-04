@@ -3,7 +3,7 @@
 #  Support Ticket Bot — Installer
 #  Tested on: Ubuntu 20.04 / 22.04 / 24.04, Debian 11 / 12
 #  Usage:
-#    bash <(curl -sL https://raw.githubusercontent.com/YOU/support-bot/main/install.sh)
+#    bash <(curl -sL https://raw.githubusercontent.com/Rrezzak09VPN/-Telegram-Support-Ticket-Bot/main/install.sh)
 # ============================================================
 
 set -euo pipefail
