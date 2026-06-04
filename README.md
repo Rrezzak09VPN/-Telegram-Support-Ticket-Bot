@@ -35,7 +35,7 @@
 ## 🖥 Установка
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/Rrezzak09VPN/-Telegram-Support-Ticket-Bot/main/install.sh)
+curl -sL https://raw.githubusercontent.com/Rrezzak09VPN/-Telegram-Support-Ticket-Bot/main/install.sh -o /tmp/install.sh && sudo bash /tmp/install.sh
 ```
 
 Установщик автоматически:
