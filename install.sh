@@ -4,6 +4,16 @@
 #  Tested on: Ubuntu 20.04 / 22.04 / 24.04, Debian 11 / 12
 #  Usage:
 #    bash <(curl -sL https://raw.githubusercontent.com/Rrezzak09VPN/-Telegram-Support-Ticket-Bot/main/install.sh)
+#
+#  Что нового в этой версии установщика:
+#    • поддержка апгрейда: при повторной установке новые ключи
+#      MAX_TICKETS_PER_DAY и TICKET_CREATE_COOLDOWN_MINUTES
+#      автоматически дописываются в существующий config.env
+#      (имеющиеся значения не перезаписываются);
+#    • bot.py сам делает миграцию схемы БД (добавляет колонки
+#      tickets.closed_by и tickets.closed_by_user_id) при старте;
+#    • bot.py сам регистрирует команды бота для синей "/"-кнопки
+#      (set_my_commands + per-admin scope).
 # ============================================================
 
 set -euo pipefail
@@ -25,6 +35,15 @@ SERVICE_NAME="support-bot"
 VENV_DIR="${INSTALL_DIR}/venv"
 REPO_URL="https://raw.githubusercontent.com/Rrezzak09VPN/-Telegram-Support-Ticket-Bot/main"
 MIN_PYTHON="3.10"
+
+# ── Дефолты новых параметров (используются и при первой установке, и при миграции) ──
+DEFAULT_MAX_FILE_SIZE="20971520"
+DEFAULT_MAX_OPEN_TICKETS="1"
+DEFAULT_MAX_MESSAGES_PER_MINUTE="10"
+DEFAULT_MAX_TICKETS_PER_DAY="5"
+DEFAULT_TICKET_CREATE_COOLDOWN_MINUTES="15"
+DEFAULT_MAX_LOG_SIZE_MB="50"
+DEFAULT_LOG_BACKUP_COUNT="5"
 
 # ── Функции вывода ──
 info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
@@ -68,7 +87,7 @@ install_system_deps() {
     ok "Системные пакеты установлены"
 }
 
-# ── Установка Python 3.11+ ──
+# ── Установка Python 3.10+ ──
 install_python() {
     local py_cmd=""
 
@@ -112,7 +131,6 @@ validate_bot_token() {
     local token="$1"
     local total_len=${#token}
     # Telegram Bot API: BOT_ID (6-12 цифр) : SECRET (35 символов base64url)
-    # Общая длина реальных токенов: 44-50 символов
     if (( total_len < 43 || total_len > 50 )); then
         return 1
     fi
@@ -126,10 +144,9 @@ validate_bot_token() {
 normalize_group_id() {
     local input="$1"
 
-    # Если передана ссылка вида https://web.telegram.org/k/#-1234567890
+    # https://web.telegram.org/k/#-1234567890
     if [[ "$input" =~ \#-?([0-9]+)$ ]]; then
         local gid="${BASH_REMATCH[1]}"
-        # Добавляем -100 если нужно
         if [[ ${#gid} -le 10 ]]; then
             echo "-100${gid}"
         else
@@ -138,25 +155,23 @@ normalize_group_id() {
         return 0
     fi
 
-    # Если передана ссылка вида https://t.me/c/1234567890
+    # https://t.me/c/1234567890
     if [[ "$input" =~ t\.me/c/([0-9]+) ]]; then
         echo "-100${BASH_REMATCH[1]}"
         return 0
     fi
 
-    # Если число без минуса, но длинное (суперчат)
+    # Длинное положительное число → дописываем -100
     if [[ "$input" =~ ^[0-9]{10,}$ ]]; then
         echo "-100${input}"
         return 0
     fi
 
-    # Если число с минусом
+    # Уже с минусом
     if [[ "$input" =~ ^-[0-9]+$ ]]; then
-        # Проверяем, есть ли уже -100
         if [[ "$input" =~ ^-100[0-9]+$ ]]; then
             echo "$input"
         else
-            # Маленький ID группы без -100 (старый формат)
             local raw="${input#-}"
             echo "-100${raw}"
         fi
@@ -169,9 +184,7 @@ normalize_group_id() {
 # ── Валидация ADMIN_IDS ──
 validate_admin_ids() {
     local input="$1"
-    # Убираем пробелы
     input="${input// /}"
-    # Проверяем формат: числа через запятую
     if [[ ! "$input" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
         return 1
     fi
@@ -179,7 +192,21 @@ validate_admin_ids() {
     return 0
 }
 
-# ── Интерактивный ввод конфигурации ──
+# ── Валидация числа в диапазоне ──
+validate_int_range() {
+    local input="$1"
+    local min="$2"
+    local max="$3"
+    if [[ ! "$input" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if (( input < min || input > max )); then
+        return 1
+    fi
+    return 0
+}
+
+# ── Интерактивный ввод конфигурации (только при первой установке) ──
 configure() {
     echo ""
     echo -e "${BOLD}── Настройка бота ──${NC}"
@@ -188,7 +215,7 @@ configure() {
     # --- BOT_TOKEN ---
     local bot_token=""
     while true; do
-        echo -e "${CYAN}1/4${NC} Введите токен бота (получить у @BotFather):"
+        echo -e "${CYAN}1/6${NC} Введите токен бота (получить у @BotFather):"
         read -rp "     Token: " bot_token
         if validate_bot_token "$bot_token"; then
             ok "Токен принят"
@@ -202,7 +229,7 @@ configure() {
     local group_id=""
     while true; do
         echo ""
-        echo -e "${CYAN}2/4${NC} Введите ID группы (супергруппа с включёнными Темами)."
+        echo -e "${CYAN}2/6${NC} Введите ID группы (супергруппа с включёнными Темами)."
         echo "     Можно вставить:"
         echo "     • Числовой ID:  -1001234567890"
         echo "     • Ссылку из веба: https://web.telegram.org/k/#-1234567890"
@@ -221,7 +248,7 @@ configure() {
     local admin_ids=""
     while true; do
         echo ""
-        echo -e "${CYAN}3/4${NC} Введите ваш Telegram ID (узнать у @userinfobot)."
+        echo -e "${CYAN}3/6${NC} Введите ваш Telegram ID (узнать у @userinfobot)."
         echo "     Несколько ID через запятую: 111222333,444555666"
         read -rp "     Admin IDs: " raw_admins
         admin_ids=$(validate_admin_ids "$raw_admins" 2>/dev/null || echo "")
@@ -235,19 +262,53 @@ configure() {
 
     # --- PROJECT_NAME ---
     echo ""
-    echo -e "${CYAN}4/4${NC} Название проекта (отображается в сообщениях бота)."
+    echo -e "${CYAN}4/6${NC} Название проекта (отображается в сообщениях бота)."
     echo "     Можно использовать эмодзи. Оставьте пустым для значения по умолчанию."
-    read -rp "     Name [Support Bot]: " project_name
+    read -rp "     Name [🎫 Support Bot]: " project_name
     if [[ -z "$project_name" ]]; then
         project_name="🎫 Support Bot"
     fi
     ok "PROJECT_NAME: ${project_name}"
+
+    # --- MAX_TICKETS_PER_DAY ---
+    local max_per_day=""
+    while true; do
+        echo ""
+        echo -e "${CYAN}5/6${NC} Максимум тикетов от одного пользователя в сутки."
+        echo "     Защита от спама \"создать-закрыть-создать-...\" (рекомендуем 3–10)."
+        read -rp "     MAX_TICKETS_PER_DAY [${DEFAULT_MAX_TICKETS_PER_DAY}]: " max_per_day
+        max_per_day="${max_per_day:-$DEFAULT_MAX_TICKETS_PER_DAY}"
+        if validate_int_range "$max_per_day" 1 1000; then
+            ok "MAX_TICKETS_PER_DAY: ${max_per_day}"
+            break
+        else
+            err "Введите целое число в диапазоне 1..1000."
+        fi
+    done
+
+    # --- TICKET_CREATE_COOLDOWN_MINUTES ---
+    local cooldown=""
+    while true; do
+        echo ""
+        echo -e "${CYAN}6/6${NC} Кулдаун между созданием тикетов одним пользователем (минуты)."
+        echo "     0 = выключено. Рекомендуем 10–15 минут."
+        read -rp "     TICKET_CREATE_COOLDOWN_MINUTES [${DEFAULT_TICKET_CREATE_COOLDOWN_MINUTES}]: " cooldown
+        cooldown="${cooldown:-$DEFAULT_TICKET_CREATE_COOLDOWN_MINUTES}"
+        if validate_int_range "$cooldown" 0 1440; then
+            ok "TICKET_CREATE_COOLDOWN_MINUTES: ${cooldown}"
+            break
+        else
+            err "Введите целое число в диапазоне 0..1440."
+        fi
+    done
 
     # --- Сохраняем ---
     BOT_TOKEN_VAL="$bot_token"
     GROUP_ID_VAL="$group_id"
     ADMIN_IDS_VAL="$admin_ids"
     PROJECT_NAME_VAL="$project_name"
+    MAX_TICKETS_PER_DAY_VAL="$max_per_day"
+    TICKET_CREATE_COOLDOWN_MINUTES_VAL="$cooldown"
 }
 
 # ── Создание структуры ──
@@ -257,7 +318,7 @@ create_structure() {
     ok "Директории созданы"
 }
 
-# ── Запись файлов ──
+# ── Запись config.env (только первая установка) ──
 write_config() {
     cat > "$CONFIG_FILE" <<ENVEOF
 # ============================================
@@ -273,29 +334,73 @@ ADMIN_IDS=${ADMIN_IDS_VAL}
 PROJECT_NAME="${PROJECT_NAME_VAL}"
 
 # === Лимиты ===
-MAX_FILE_SIZE=20971520
-MAX_OPEN_TICKETS=1
-MAX_MESSAGES_PER_MINUTE=10
+# Размер вложения, байт (20 МБ)
+MAX_FILE_SIZE=${DEFAULT_MAX_FILE_SIZE}
+# Сколько одновременно открытых тикетов может быть у одного пользователя
+MAX_OPEN_TICKETS=${DEFAULT_MAX_OPEN_TICKETS}
+# Антифлуд по сообщениям (per minute)
+MAX_MESSAGES_PER_MINUTE=${DEFAULT_MAX_MESSAGES_PER_MINUTE}
+# Жёсткий антиспам: сколько тикетов один юзер может создать за сутки
+MAX_TICKETS_PER_DAY=${MAX_TICKETS_PER_DAY_VAL}
+# Кулдаун между созданием тикетов (минуты). 0 = выключено
+TICKET_CREATE_COOLDOWN_MINUTES=${TICKET_CREATE_COOLDOWN_MINUTES_VAL}
 
 # === Пути ===
 DATA_DIR="${DATA_DIR}"
 
 # === Логирование ===
-MAX_LOG_SIZE_MB=50
-LOG_BACKUP_COUNT=5
+MAX_LOG_SIZE_MB=${DEFAULT_MAX_LOG_SIZE_MB}
+LOG_BACKUP_COUNT=${DEFAULT_LOG_BACKUP_COUNT}
 ENVEOF
 
     chmod 600 "$CONFIG_FILE"
     ok "Конфигурация сохранена: ${CONFIG_FILE}"
 }
 
+# ── Миграция config.env при апгрейде ──
+# Дописывает только те ключи, которых ещё нет в файле.
+# Существующие значения НЕ перезаписывает.
+migrate_config() {
+    info "Проверка конфигурации на новые ключи..."
+
+    declare -A new_keys=(
+        ["MAX_TICKETS_PER_DAY"]="${DEFAULT_MAX_TICKETS_PER_DAY}"
+        ["TICKET_CREATE_COOLDOWN_MINUTES"]="${DEFAULT_TICKET_CREATE_COOLDOWN_MINUTES}"
+    )
+
+    local added=0
+    local appended_block=""
+
+    for key in "${!new_keys[@]}"; do
+        # Ищем ключ в начале строки (без учёта пробелов перед ним).
+        if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE"; then
+            continue
+        fi
+        appended_block+="${key}=${new_keys[$key]}"$'\n'
+        added=$((added + 1))
+        info "  + добавлен ключ: ${key}=${new_keys[$key]}"
+    done
+
+    if (( added > 0 )); then
+        {
+            echo ""
+            echo "# === Добавлено миграцией $(date '+%Y-%m-%d %H:%M:%S') ==="
+            printf "%s" "$appended_block"
+        } >> "$CONFIG_FILE"
+        ok "Миграция конфига: добавлено новых ключей — ${added}"
+    else
+        ok "Конфигурация актуальна, новых ключей не требуется"
+    fi
+
+    # Гарантируем разумные права
+    chmod 600 "$CONFIG_FILE"
+}
+
 write_bot() {
-    # Если запускаем из клонированного репо
     if [[ -f "$(dirname "$0")/bot.py" ]]; then
         cp "$(dirname "$0")/bot.py" "${INSTALL_DIR}/bot.py"
         cp "$(dirname "$0")/requirements.txt" "${INSTALL_DIR}/requirements.txt"
     else
-        # Скачиваем с GitHub
         info "Загрузка bot.py..."
         curl -sL "${REPO_URL}/bot.py" -o "${INSTALL_DIR}/bot.py"
         curl -sL "${REPO_URL}/requirements.txt" -o "${INSTALL_DIR}/requirements.txt"
@@ -305,10 +410,12 @@ write_bot() {
 
 # ── Python venv + зависимости ──
 setup_venv() {
-    info "Создание виртуального окружения..."
-    "$PYTHON_CMD" -m venv "$VENV_DIR"
+    info "Создание / обновление виртуального окружения..."
+    if [[ ! -d "$VENV_DIR" ]]; then
+        "$PYTHON_CMD" -m venv "$VENV_DIR"
+    fi
     "${VENV_DIR}/bin/pip" install --upgrade pip -q
-    "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q
+    "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q --upgrade
     ok "Python-зависимости установлены"
 }
 
@@ -397,7 +504,6 @@ BKEOF
 # ── Cron для бэкапов ──
 setup_cron_backup() {
     local cron_line="0 3 * * * ${INSTALL_DIR}/backup.sh >> ${DATA_DIR}/backup.log 2>&1"
-    # Удаляем старую строку если была
     (crontab -l 2>/dev/null | grep -v "support-bot/backup.sh" ; echo "$cron_line") | crontab -
     ok "Cron-бэкап настроен: ежедневно в 03:00"
 }
@@ -484,7 +590,7 @@ UNEOF
 # ── Запуск бота ──
 start_bot() {
     info "Запуск бота..."
-    systemctl start "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
     sleep 2
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then
@@ -501,7 +607,11 @@ start_bot() {
 print_summary() {
     echo ""
     echo -e "${BOLD}╔══════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║          ✅ Установка завершена!             ║${NC}"
+    if [[ "$UPGRADE" -eq 1 ]]; then
+        echo -e "${BOLD}║          ✅ Обновление завершено!           ║${NC}"
+    else
+        echo -e "${BOLD}║          ✅ Установка завершена!             ║${NC}"
+    fi
     echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  📁 Директория:   ${CYAN}${INSTALL_DIR}${NC}"
@@ -526,6 +636,15 @@ print_summary() {
     echo -e "  ${BOLD}Удаление:${NC}"
     echo -e "    ${INSTALL_DIR}/uninstall.sh"
     echo ""
+    echo -e "  ${BOLD}Новое в этой версии:${NC}"
+    echo -e "    • суточный лимит тикетов:        ${CYAN}MAX_TICKETS_PER_DAY${NC}"
+    echo -e "    • кулдаун между тикетами:        ${CYAN}TICKET_CREATE_COOLDOWN_MINUTES${NC}"
+    echo -e "    • постоянное меню (нижние кнопки) у юзера и админа"
+    echo -e "    • меню \"/\" возле скрепки (set_my_commands)"
+    echo -e "    • имя темы при закрытии: ${CYAN}🔴 🛠 #N | @user (id)${NC}"
+    echo -e "    • БД пишет ${CYAN}closed_by${NC} (user/admin/system) и ${CYAN}closed_by_user_id${NC}"
+    echo -e "    • reconcile при старте: сверяет темы Telegram <-> БД"
+    echo ""
     echo -e "  ${YELLOW}⚠️  Не забудьте включить Темы (Topics) в настройках Telegram-группы!${NC}"
     echo -e "  ${YELLOW}⚠️  Бот должен быть администратором в этой группе.${NC}"
     echo ""
@@ -537,7 +656,8 @@ check_existing() {
         echo ""
         warn "Обнаружена существующая установка!"
         echo ""
-        echo "  1) Переустановить (данные сохранятся, код обновится)"
+        echo "  1) Обновить (код и зависимости, данные и конфиг сохраняются,"
+        echo "     новые ключи дописываются автоматически)"
         echo "  2) Отмена"
         echo ""
         read -rp "  Выбор [1/2]: " choice
@@ -577,7 +697,7 @@ main() {
     if [[ "$UPGRADE" -eq 0 ]]; then
         write_config
     else
-        info "Конфигурация не тронута: ${CONFIG_FILE}"
+        migrate_config
     fi
 
     write_bot
